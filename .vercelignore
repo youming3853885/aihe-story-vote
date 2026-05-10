@@ -1,0 +1,5 @@
+.playwright-mcp
+.superpowers
+drive_pdf_cache
+*.png
+*.md
