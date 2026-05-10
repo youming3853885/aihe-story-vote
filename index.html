@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>水路旅人故事投票分頁</title>
-  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230d3f4f'/%3E%3Cpath d='M9 37c10-9 16 4 25-5 7-7 11-13 21-8' fill='none' stroke='%238ed8df' stroke-width='9' stroke-linecap='round'/%3E%3Cpath d='M12 43c9-4 16 2 25-4 6-4 11-5 16-3' fill='none' stroke='%23ffe4a3' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E" type="image/svg+xml">
   <style>
     :root {
       --river: #166f83;
@@ -777,6 +777,7 @@
     </main>
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     const basePolls = [
       {
@@ -855,18 +856,77 @@
       }
     ];
 
+    const ROOM_CODE = "AIHE-426";
+    const SUPABASE_URL = "https://whqvlradnvyxpeezrzwt.supabase.co";
+    const SUPABASE_PUBLISHABLE_KEY = "sb_publishable__0ZyCk-2Rz71ARrn_UtNGw_WZMuxlms";
+    const supabaseClient = window.supabase?.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+
+    function ensureVoterId() {
+      let id = localStorage.getItem("aiheVoterId");
+      if (!id) {
+        id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem("aiheVoterId", id);
+      }
+      return id;
+    }
+
+    const voterId = ensureVoterId();
     const customPollOptions = JSON.parse(localStorage.getItem("customPollOptions") || "{}");
     const savedVotes = JSON.parse(localStorage.getItem("pollVotes") || "{}");
-    const polls = basePolls.map(poll => {
-      const extras = customPollOptions[poll.id] || [];
-      const defaultVotes = [...poll.votes, ...extras.map(() => 0)];
-      const persisted = savedVotes[poll.id] || [];
-      return {
-        ...poll,
-        options: [...poll.options, ...extras.map(option => [option.title, option.description])],
-        votes: defaultVotes.map((value, index) => Number.isFinite(persisted[index]) ? persisted[index] : value)
-      };
-    });
+    const locked = new Set(JSON.parse(localStorage.getItem("lockedPolls") || "[]"));
+    const selections = JSON.parse(localStorage.getItem("pollSelections") || "{}");
+    let pollOptionRows = [];
+    let voteRows = [];
+    let uploadRows = {};
+    let groupDrafts = {};
+    let remoteReady = false;
+    let polls = buildLocalPolls();
+
+    function buildLocalPolls() {
+      return basePolls.map(poll => {
+        const extras = customPollOptions[poll.id] || [];
+        const defaultVotes = [...poll.votes, ...extras.map(() => 0)];
+        const persisted = savedVotes[poll.id] || [];
+        return {
+          ...poll,
+          options: [...poll.options, ...extras.map(option => [option.title, option.description])],
+          votes: defaultVotes.map((value, index) => Number.isFinite(persisted[index]) ? persisted[index] : value)
+        };
+      });
+    }
+
+    function makeOption(row) {
+      const option = [row.title, row.description];
+      option.dbId = row.id;
+      option.isCustom = row.is_custom;
+      option.optionIndex = row.option_index;
+      return option;
+    }
+
+    function applyRemoteState() {
+      if (!pollOptionRows.length) return;
+      const ownVotes = new Map(voteRows.filter(vote => vote.voter_id === voterId).map(vote => [vote.poll_id, vote]));
+      locked.clear();
+      Object.keys(selections).forEach(key => delete selections[key]);
+
+      polls = basePolls.map(basePoll => {
+        const optionRows = pollOptionRows
+          .filter(row => row.poll_id === basePoll.id)
+          .sort((a, b) => a.option_index - b.option_index);
+        const options = optionRows.map(makeOption);
+        const votes = options.map(option => voteRows.filter(vote => vote.option_id === option.dbId).length);
+        const ownVote = ownVotes.get(basePoll.id);
+        if (ownVote) {
+          const selectedIndex = options.findIndex(option => option.dbId === ownVote.option_id);
+          if (selectedIndex >= 0) {
+            selections[basePoll.id] = selectedIndex;
+            locked.add(basePoll.id);
+          }
+        }
+        return { ...basePoll, options, votes };
+      });
+      remoteReady = true;
+    }
 
     const groupPages = {
       "upstream": {
@@ -895,11 +955,130 @@
       }
     };
 
-    const locked = new Set(JSON.parse(localStorage.getItem("lockedPolls") || "[]"));
-    const selections = JSON.parse(localStorage.getItem("pollSelections") || "{}");
-
     function total(votes) {
       return votes.reduce((sum, value) => sum + value, 0);
+    }
+
+    async function seedBaseOptions() {
+      if (!supabaseClient) return;
+      const rows = [];
+      basePolls.forEach(poll => {
+        poll.options.forEach((option, optionIndex) => {
+          rows.push({
+            room_code: ROOM_CODE,
+            poll_id: poll.id,
+            option_index: optionIndex,
+            title: option[0],
+            description: option[1],
+            is_custom: false
+          });
+        });
+      });
+      const { error } = await supabaseClient
+        .from("aihe_poll_options")
+        .upsert(rows, { onConflict: "room_code,poll_id,option_index", ignoreDuplicates: true });
+      if (error) throw error;
+    }
+
+    async function loadRemoteState() {
+      if (!supabaseClient) return;
+      const [optionsResult, votesResult, uploadsResult, groupResult] = await Promise.all([
+        supabaseClient.from("aihe_poll_options").select("*").eq("room_code", ROOM_CODE).order("poll_id").order("option_index"),
+        supabaseClient.from("aihe_poll_votes").select("*").eq("room_code", ROOM_CODE),
+        supabaseClient.from("aihe_uploads").select("*").eq("room_code", ROOM_CODE),
+        supabaseClient.from("aihe_group_work").select("*").eq("room_code", ROOM_CODE)
+      ]);
+      const firstError = optionsResult.error || votesResult.error || uploadsResult.error || groupResult.error;
+      if (firstError) throw firstError;
+      pollOptionRows = optionsResult.data || [];
+      voteRows = votesResult.data || [];
+      uploadRows = Object.fromEntries((uploadsResult.data || []).map(row => [row.slot_key, row]));
+      groupDrafts = Object.fromEntries((groupResult.data || []).map(row => [row.group_key, row.data || {}]));
+      applyRemoteState();
+    }
+
+    function subscribeRemoteChanges() {
+      if (!supabaseClient) return;
+      supabaseClient
+        .channel(`aihe-room-${ROOM_CODE}`)
+        .on("postgres_changes", { event: "*", schema: "public", table: "aihe_poll_options", filter: `room_code=eq.${ROOM_CODE}` }, refreshFromRemote)
+        .on("postgres_changes", { event: "*", schema: "public", table: "aihe_poll_votes", filter: `room_code=eq.${ROOM_CODE}` }, refreshFromRemote)
+        .on("postgres_changes", { event: "*", schema: "public", table: "aihe_uploads", filter: `room_code=eq.${ROOM_CODE}` }, refreshFromRemote)
+        .on("postgres_changes", { event: "*", schema: "public", table: "aihe_group_work", filter: `room_code=eq.${ROOM_CODE}` }, refreshFromRemote)
+        .subscribe();
+    }
+
+    let refreshTimer;
+    function refreshFromRemote() {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(async () => {
+        await loadRemoteState();
+        renderGroupPages();
+        renderTeacherAssets();
+        render();
+      }, 160);
+    }
+
+    async function saveRemoteVote(poll, choice) {
+      const option = poll.options[choice];
+      if (!option?.dbId) return;
+      const { error } = await supabaseClient.from("aihe_poll_votes").insert({
+        room_code: ROOM_CODE,
+        poll_id: poll.id,
+        option_id: option.dbId,
+        voter_id: voterId
+      });
+      if (error && error.code !== "23505") throw error;
+      await refreshFromRemote();
+    }
+
+    async function addRemoteCustomOption(poll, title, description) {
+      const nextIndex = Math.max(-1, ...poll.options.map(option => option.optionIndex ?? -1)) + 1;
+      const { error } = await supabaseClient.from("aihe_poll_options").insert({
+        room_code: ROOM_CODE,
+        poll_id: poll.id,
+        option_index: nextIndex,
+        title,
+        description,
+        is_custom: true
+      });
+      if (error) throw error;
+      await refreshFromRemote();
+    }
+
+    async function uploadRemoteImage(slotKey, file) {
+      const extension = (file.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const path = `${ROOM_CODE}/${slotKey}-${Date.now()}.${extension || "png"}`;
+      const { error: uploadError } = await supabaseClient.storage
+        .from("aihe-assets")
+        .upload(path, file, { upsert: true, contentType: file.type || "image/png" });
+      if (uploadError) throw uploadError;
+      const { data } = supabaseClient.storage.from("aihe-assets").getPublicUrl(path);
+      const publicUrl = data.publicUrl;
+      const { error: rowError } = await supabaseClient.from("aihe_uploads").upsert({
+        room_code: ROOM_CODE,
+        slot_key: slotKey,
+        bucket_path: path,
+        public_url: publicUrl,
+        updated_at: new Date().toISOString()
+      }, { onConflict: "room_code,slot_key" });
+      if (rowError) throw rowError;
+      uploadRows[slotKey] = { slot_key: slotKey, bucket_path: path, public_url: publicUrl };
+      return publicUrl;
+    }
+
+    async function initSupabase() {
+      if (!supabaseClient) return;
+      try {
+        await seedBaseOptions();
+        await loadRemoteState();
+        renderGroupPages();
+        renderTeacherAssets();
+        render();
+        subscribeRemoteChanges();
+      } catch (error) {
+        console.error("Supabase sync failed", error);
+      }
     }
 
     function render() {
@@ -914,7 +1093,7 @@
         el.className = "poll";
         el.innerHTML = `
           <div class="poll-head">
-            <h3>${pollIndex + 1}. ${poll.title}</h3>
+            <h3>${pollIndex + 1}. ${escapeHtml(poll.title)}</h3>
             <span class="badge ${pollLocked ? "locked" : ""}">${pollLocked ? "已鎖定" : poll.stage}</span>
           </div>
           <div class="options"></div>
@@ -934,9 +1113,9 @@
           item.innerHTML = `
             <div class="option-title">
               <span class="letter">${String.fromCharCode(65 + optionIndex)}</span>
-              <span>${option[0]}</span>
+              <span>${escapeHtml(option[0])}</span>
             </div>
-            <p>${option[1]}</p>
+            <p>${escapeHtml(option[1])}</p>
             <div class="bar-row">
               <div class="bar"><span style="width:${pct}%"></span></div>
               <div class="pct">${pct}%</div>
@@ -951,9 +1130,13 @@
           list.appendChild(item);
         });
 
-        el.querySelector("button").addEventListener("click", () => {
+        el.querySelector("button").addEventListener("click", async () => {
           const choice = selections[poll.id];
           if (choice === undefined || locked.has(poll.id)) return;
+          if (supabaseClient && remoteReady) {
+            await saveRemoteVote(poll, choice);
+            return;
+          }
           poll.votes[choice] += 1;
           savedVotes[poll.id] = poll.votes;
           locked.add(poll.id);
@@ -975,11 +1158,15 @@
           </div>
           <button type="button">加入選項</button>
         `;
-        custom.querySelector("button").addEventListener("click", () => {
+        custom.querySelector("button").addEventListener("click", async () => {
           const inputs = custom.querySelectorAll("input");
           const title = inputs[0].value.trim();
           const description = inputs[1].value.trim();
           if (!title || !description) return;
+          if (supabaseClient && remoteReady) {
+            await addRemoteCustomOption(poll, title, description);
+            return;
+          }
           customPollOptions[poll.id] = customPollOptions[poll.id] || [];
           customPollOptions[poll.id].push({ title, description });
           localStorage.setItem("customPollOptions", JSON.stringify(customPollOptions));
@@ -1002,7 +1189,7 @@
       status.innerHTML = polls.map((poll, index) => `
         <div class="status">
           <span class="dot ${locked.has(poll.id) ? "done" : ""}"></span>
-          <span>${index + 1}. ${poll.title}</span>
+          <span>${index + 1}. ${escapeHtml(poll.title)}</span>
           <strong>${locked.has(poll.id) ? "完成" : "未投"}</strong>
         </div>
       `).join("");
@@ -1010,7 +1197,17 @@
       renderStoryGenerator();
     }
 
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
     function groupTemplate(key, data) {
+      const draft = groupDrafts[key] || {};
       return `
         <div class="group-workspace">
           <div class="group-hero">
@@ -1024,37 +1221,33 @@
             <div class="form-panel">
               <h3>關卡設計表</h3>
               <label>這一關的名稱</label>
-              <input value="${data.chip}記憶柵欄" aria-label="關卡名稱">
+              <input data-group-field="levelName" value="${escapeHtml(draft.levelName || `${data.chip}記憶柵欄`)}" aria-label="關卡名稱">
               <label>老師被卡住的畫面</label>
-              <textarea>老師漂到${data.chip}柵欄前，被一個奇怪的水路機關擋住，需要解開地方記憶才能繼續往台灣海峽前進。</textarea>
+              <textarea data-group-field="stuckScene">${escapeHtml(draft.stuckScene || `老師漂到${data.chip}柵欄前，被一個奇怪的水路機關擋住，需要解開地方記憶才能繼續往台灣海峽前進。`)}</textarea>
               <label>要考大家的題目</label>
-              <textarea placeholder="例如：哪一個建築／交通／產業和這段愛河最有關？答案要能從資料找到。"></textarea>
+              <textarea data-group-field="question" placeholder="例如：哪一個建築／交通／產業和這段愛河最有關？答案要能從資料找到。">${escapeHtml(draft.question || "")}</textarea>
               <label>謎題玩法</label>
-              <select>
-                <option>選擇題</option>
-                <option>排序題</option>
-                <option>配對題</option>
-                <option>找線索題</option>
-                <option>密碼題</option>
+              <select data-group-field="puzzleType">
+                ${["選擇題", "排序題", "配對題", "找線索題", "密碼題"].map(type => `<option ${draft.puzzleType === type ? "selected" : ""}>${type}</option>`).join("")}
               </select>
               <label>正確答案與解釋</label>
-              <textarea placeholder="寫出正確答案，並用一句話說明為什麼。"></textarea>
+              <textarea data-group-field="answer" placeholder="寫出正確答案，並用一句話說明為什麼。">${escapeHtml(draft.answer || "")}</textarea>
               <label>過關後柵欄怎麼打開</label>
-              <textarea>柵欄上的記憶燈亮起，水流恢復，老師一邊尖叫一邊繼續往下一段漂。</textarea>
+              <textarea data-group-field="unlockScene">${escapeHtml(draft.unlockScene || "柵欄上的記憶燈亮起，水流恢復，老師一邊尖叫一邊繼續往下一段漂。")}</textarea>
               <div class="save-row">
-                <button class="ghost-btn">暫存草稿</button>
-                <button>提交本組設計</button>
+                <button class="ghost-btn save-group" data-group-key="${key}" type="button">暫存草稿</button>
+                <button class="save-group" data-group-key="${key}" type="button">提交本組設計</button>
               </div>
             </div>
             <div>
               <div class="form-panel">
                 <h3>角色分配</h3>
                 <div class="role-grid">
-                  <div class="role-row"><span>組長</span><input placeholder="同學姓名"></div>
-                  <div class="role-row"><span>美術</span><input placeholder="角色、場景、柵欄視覺"></div>
-                  <div class="role-row"><span>謎題設計</span><input placeholder="題目、選項、答案"></div>
-                  <div class="role-row"><span>故事設計</span><input placeholder="劇情、對話、過關文字"></div>
-                  <div class="role-row"><span>Genially 操作</span><input placeholder="把內容放到平台"></div>
+                  <div class="role-row"><span>組長</span><input data-group-field="roleLeader" value="${escapeHtml(draft.roleLeader || "")}" placeholder="同學姓名"></div>
+                  <div class="role-row"><span>美術</span><input data-group-field="roleArt" value="${escapeHtml(draft.roleArt || "")}" placeholder="角色、場景、柵欄視覺"></div>
+                  <div class="role-row"><span>謎題設計</span><input data-group-field="rolePuzzle" value="${escapeHtml(draft.rolePuzzle || "")}" placeholder="題目、選項、答案"></div>
+                  <div class="role-row"><span>故事設計</span><input data-group-field="roleStory" value="${escapeHtml(draft.roleStory || "")}" placeholder="劇情、對話、過關文字"></div>
+                  <div class="role-row"><span>Genially 操作</span><input data-group-field="roleGenially" value="${escapeHtml(draft.roleGenially || "")}" placeholder="把內容放到平台"></div>
                 </div>
               </div>
               <div class="form-panel" style="margin-top:14px">
@@ -1081,7 +1274,7 @@
     }
 
     function uploadBox(id, title) {
-      const image = localStorage.getItem(`upload-${id}`);
+      const image = uploadRows[id]?.public_url || localStorage.getItem(`upload-${id}`);
       return `
         <div class="upload-box">
           <strong>${title}</strong>
@@ -1094,14 +1287,27 @@
 
     function bindImageInputs() {
       document.querySelectorAll("input[type='file'][data-upload-id]").forEach(input => {
-        input.addEventListener("change", event => {
+        input.addEventListener("change", async event => {
           const file = event.target.files[0];
           if (!file) return;
+          const id = event.target.dataset.uploadId;
+          const preview = document.getElementById(`preview-${id}`);
+          if (preview) {
+            preview.src = URL.createObjectURL(file);
+            preview.style.display = "block";
+          }
+          if (supabaseClient && remoteReady) {
+            try {
+              const publicUrl = await uploadRemoteImage(id, file);
+              if (preview) preview.src = publicUrl;
+              return;
+            } catch (error) {
+              console.error("Image upload failed", error);
+            }
+          }
           const reader = new FileReader();
           reader.onload = () => {
-            const id = event.target.dataset.uploadId;
             localStorage.setItem(`upload-${id}`, reader.result);
-            const preview = document.getElementById(`preview-${id}`);
             if (preview) {
               preview.src = reader.result;
               preview.style.display = "block";
@@ -1117,6 +1323,39 @@
         document.getElementById(`page-${key}`).innerHTML = groupTemplate(key, data);
       });
       bindImageInputs();
+      bindGroupSaveButtons();
+    }
+
+    function bindGroupSaveButtons() {
+      document.querySelectorAll(".save-group").forEach(button => {
+        button.addEventListener("click", async () => {
+          const key = button.dataset.groupKey;
+          const page = document.getElementById(`page-${key}`);
+          const data = {};
+          page.querySelectorAll("[data-group-field]").forEach(field => {
+            data[field.dataset.groupField] = field.value;
+          });
+          groupDrafts[key] = data;
+          if (supabaseClient && remoteReady) {
+            const { error } = await supabaseClient.from("aihe_group_work").upsert({
+              room_code: ROOM_CODE,
+              group_key: key,
+              data,
+              updated_at: new Date().toISOString()
+            }, { onConflict: "room_code,group_key" });
+            if (error) {
+              console.error("Save group draft failed", error);
+              return;
+            }
+          } else {
+            localStorage.setItem(`groupDraft-${key}`, JSON.stringify(data));
+          }
+          button.textContent = "已儲存";
+          setTimeout(() => {
+            button.textContent = button.classList.contains("ghost-btn") ? "暫存草稿" : "提交本組設計";
+          }, 1200);
+        });
+      });
     }
 
     function topOption(poll) {
@@ -1189,15 +1428,15 @@
             <div class="winner-grid">
               ${Object.values(parts).map(item => `
                 <div class="winner-card">
-                  <span>${item.poll} · ${item.percent}%</span>
-                  <strong>${item.title}</strong>
+                  <span>${escapeHtml(item.poll)} · ${item.percent}%</span>
+                  <strong>${escapeHtml(item.title)}</strong>
                 </div>
               `).join("")}
             </div>
             <div class="save-row">
               <button id="localStoryBtn">生成班級故事框架</button>
             </div>
-            <div class="story-output" id="storyOutput">${buildStory(parts)}</div>
+            <div class="story-output" id="storyOutput">${escapeHtml(buildStory(parts))}</div>
           </div>
           <div class="form-panel">
             <h3>Gemini 輔助改寫</h3>
@@ -1207,7 +1446,7 @@
             <label>模型名稱</label>
             <input id="geminiModel" value="gemini-2.5-flash">
             <label>送給 Gemini 的提示詞</label>
-            <textarea id="geminiPrompt" style="min-height:190px">${buildGeminiPrompt(parts)}</textarea>
+            <textarea id="geminiPrompt" style="min-height:190px">${escapeHtml(buildGeminiPrompt(parts))}</textarea>
             <div class="save-row">
               <button class="ghost-btn" id="copyPromptBtn">複製提示詞</button>
               <button id="geminiBtn">用 Gemini 生成</button>
@@ -1286,6 +1525,7 @@
     renderGroupPages();
     renderTeacherAssets();
     render();
+    initSupabase();
   </script>
 </body>
 </html>
