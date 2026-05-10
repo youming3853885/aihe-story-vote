@@ -3,3 +3,5 @@
 drive_pdf_cache/
 *.png
 *.md
+
+.vercel
